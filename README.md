@@ -20,7 +20,7 @@ The easiest way to start all services (Dashboard + API + Alerts + Backtesting):
 If you prefer running components individually:
 ```bash
 # Terminal 1: Start Backend API
-python signals/api_starter.py
+python signals/api.py
 
 # Terminal 2: Start Dashboard
 streamlit run 0_Overview.py
@@ -119,6 +119,8 @@ AI POWERED SIGNALS/
 │   └── 2_🧪_Backtesting.py # Historic Performance Page
 │
 ├── signals/               # 📡 Backend API Service
+```
+
 ## 🎯 Features
 
 - ✅ **One-Command Startup** - Everything auto-starts
@@ -158,12 +160,10 @@ AI POWERED SIGNALS/
 ```bash
 # Test all API endpoints
 python test_api_endpoints.py
->>>>>>> 8c63e55a142554d1168e0c75b9b001ef1e1f2353
 ```
 
 ---
 
-<<<<<<< HEAD
 ## 📡 Core API Endpoints
 
 ### Predictions
@@ -190,66 +190,3 @@ python test_api_endpoints.py
 
 **Built by:** Aman (DE Team)  
 **License:** MIT
-=======
-## 📁 Project Structure
-
-```
-ProjD-main/
-├── 0_Overview.py        # Main dashboard (AUTO-STARTS API!)
-├── signals/             # API & ML Models
-│   ├── start_api.py    # Manual API starter (if needed)
-│   ├── api.py          # FastAPI server
-│   ├── train_and_save.py # Model training
-│   └── requirements.txt # Dependencies
-├── utils/
-│   └── api_starter.py  # Background API launcher
-├── pages/              # Dashboard pages
-├── data/               # Data fetchers & adapters
-├── ml/                 # ML predictor
-└── ui/                 # UI components
-```
-
----
-
-## 🔧 Manual Steps (Only If Needed)
-
-### Run API Server Only
-```bash
-python signals/start_api.py
-```
-
-### Install Dependencies Only
-```bash
-pip install -r signals/requirements.txt
-```
-
-### Train Models Only
-```bash
-cd signals
-python train_and_save.py
-```
-
----
-
-## 📚 Full Documentation
-
-See [docs/README.md](docs/README.md) for complete documentation.
-
----
-
-## ⚡ How It Works
-
-1. **Run Dashboard:** `streamlit run 0_Overview.py`
-2. **Auto-Detection:** Checks if API is running
-3. **Auto-Start:** Launches API in background if needed
-4. **Auto-Setup:** Installs dependencies & trains models
-5. **Ready!** Everything works seamlessly
-
----
-
-**Version:** 2.0.0 - Auto-Start Integration  
-**Updated:** January 9, 2026  
-**API by:** Aman (DE Team)
->>>>>>> 8c63e55a142554d1168e0c75b9b001ef1e1f2353
-#   A I - p o w e r e d - s t o c k - a n d - E T F - t r a d i n g - p l a t f o r m  
- 
