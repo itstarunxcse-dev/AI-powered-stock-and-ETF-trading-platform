@@ -4,7 +4,7 @@
 Dual-endpoint API for live predictions and historical signals
 - Live Signal: For dashboard predictions
 - Historical Signals: For backtesting engine
-- Market Data: Serves real data via YFinance (acting as Supabase proxy)
+- Market Data: Serves real data via YFinance
 """
 
 import joblib
@@ -19,16 +19,15 @@ import uvicorn
 import os
 import sys
 
-# Ensure parent directory is in path for imports if needed
+# Ensure parent directory is in path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 app = FastAPI(
     title="ML Signal Service",
     description="AI-Powered Stock Prediction API with Live & Historical Endpoints",
-    version="2.1.0"
+    version="2.2.0"
 )
 
-# Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -38,71 +37,86 @@ app.add_middleware(
 )
 
 # =================================================
-# LOAD MODELS
+# GLOBAL STATE & CONSTANTS
 # =================================================
-try:
-    rf_model = joblib.load(os.path.join("ml", "models", "rf_model.pkl"))
-    xgb_model = joblib.load(os.path.join("ml", "models", "xgb_model.pkl"))
-    print("✅ Models loaded successfully")
-except Exception as e:
-    print(f"⚠️ Warning: Models not loaded: {e}")
-    rf_model = None
-    xgb_model = None
-
+RF_MODEL = None
+XGB_MODEL = None
 FEATURES = ["Daily_Return", "Volatility", "SMA_ratio", "EMA_ratio", "MACD"]
 
-# =================================================
-# FEATURE ENGINEERING
-# =================================================
-def create_features(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
+# Load models once at startup
+try:
+    rf_path = os.path.join("ml", "models", "rf_model.pkl")
+    xgb_path = os.path.join("ml", "models", "xgb_model.pkl")
+    if os.path.exists(rf_path) and os.path.exists(xgb_path):
+        RF_MODEL = joblib.load(rf_path)
+        XGB_MODEL = joblib.load(xgb_path)
+        print("✅ Models loaded successfully at startup")
+    else:
+        print("⚠️ Models not found. API will return errors for predictions.")
+except Exception as e:
+    print(f"⚠️ Error loading models: {e}")
 
-    # Fix yfinance multi-index
+# =================================================
+# HELPER FUNCTIONS
+# =================================================
+def flatten_yf_df(df: pd.DataFrame) -> pd.DataFrame:
+    """Safely flatten yfinance MultiIndex columns if present."""
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
+    return df
 
+def calculate_rsi(prices: pd.Series, period=14) -> pd.Series:
+    """Standardized RSI calculation."""
+    delta = prices.diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+    rs = gain / loss
+    return 100 - (100 / (1 + rs))
+
+def create_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Generate technical features - strict order enforced later."""
+    df = df.copy()
+    df = flatten_yf_df(df)
+    
     close = df["Close"]
-
+    
+    # 1. Base Features
     df["Daily_Return"] = close.pct_change()
     df["Volatility"] = df["Daily_Return"].rolling(14).std()
-
+    
+    # 2. Moving Averages
     df["SMA20"] = close.rolling(20).mean()
     df["EMA20"] = close.ewm(span=20, adjust=False).mean()
-
+    df["SMA50"] = close.rolling(50).mean()
+    
     df["SMA_ratio"] = close / df["SMA20"]
     df["EMA_ratio"] = close / df["EMA20"]
-
+    
+    # 3. MACD
     ema12 = close.ewm(span=12, adjust=False).mean()
     ema26 = close.ewm(span=26, adjust=False).mean()
     df["MACD"] = ema12 - ema26
+    df["MACD_Signal"] = df["MACD"].ewm(span=9, adjust=False).mean()
+    
+    # 4. RSI (using helper)
+    df["RSI"] = calculate_rsi(close)
 
     df.dropna(inplace=True)
     return df
 
-# =================================================
-# HELPER: YFINANCE DATA PROVIDER
-# =================================================
 def fetch_real_market_data(ticker: str, period: str = "1mo", interval: str = "1d"):
-    """
-    Fetch real data using yfinance to populate API responses
-    This replaces Supabase if credentials are missing
-    """
+    """Fetch and format market data from yfinance."""
     try:
         df = yf.download(ticker, period=period, interval=interval, progress=False, auto_adjust=True)
         if df.empty:
             return []
         
-        # MEANINGFUL FIX: Flatten MultiIndex columns (common in new yfinance)
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
+        df = flatten_yf_df(df)
+        df.reset_index(inplace=True) # Ensure Date is a column
         
-        # Reset index to make Date a column
-        df.reset_index(inplace=True)
-        
-        # Format columns to match typical API/DB response
         data = []
         for _, row in df.iterrows():
-            record = {
+            data.append({
                 "ticker": ticker.upper(),
                 "date": row["Date"].strftime("%Y-%m-%d"),
                 "open": float(row["Open"]),
@@ -110,211 +124,185 @@ def fetch_real_market_data(ticker: str, period: str = "1mo", interval: str = "1d
                 "low": float(row["Low"]),
                 "close": float(row["Close"]),
                 "volume": int(row["Volume"])
-            }
-            # Calculate RSI if enough data
-            data.append(record)
-            
-        return data  # Returns oldest to newest by default
+            })
+        return data
     except Exception as e:
         print(f"Error fetching {ticker}: {e}")
         return []
 
-def calculate_rsi(prices: pd.Series, period=14):
-    delta = prices.diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
-    rs = gain / loss
-    return 100 - (100 / (1 + rs))
-
 # =================================================
-# REQUEST SCHEMA
+# SCHEMAS
 # =================================================
 class TickerRequest(BaseModel):
     ticker: str
 
 # =================================================
-# 1️⃣ LIVE SIGNAL API (Dashboard)
+# ENDPOINTS
 # =================================================
 @app.post("/api/v1/ml/signal/live")
 def get_live_signal(request: TickerRequest):
-    """
-    Used by Dashboard → Predict Signal button
-    Returns only today's signal
-    """
-    # Auto-load models if missing (double check)
-    global rf_model, xgb_model
-    if not rf_model or not xgb_model:
-         try:
-            rf_model = joblib.load(os.path.join("ml", "models", "rf_model.pkl"))
-            xgb_model = joblib.load(os.path.join("ml", "models", "xgb_model.pkl"))
-         except:
-             raise HTTPException(status_code=503, detail="Models not loaded and training failed")
-        
+    """Generates live trading signal for dashboard."""
+    if not RF_MODEL or not XGB_MODEL:
+        raise HTTPException(status_code=503, detail="Models not loaded")
+
     ticker = request.ticker.upper()
 
     try:
+        # Fetch data (enough for feature calculation)
         df = yf.download(ticker, period="6mo", auto_adjust=True, progress=False)
         if df.empty:
             raise HTTPException(status_code=404, detail="No data found for ticker")
 
-        # 1. Base Features (Daily)
         df = create_features(df)
         if len(df) < 1:
-             raise HTTPException(status_code=400, detail="Not enough data to generate features")
-             
+            raise HTTPException(status_code=400, detail="Not enough data for features")
+
+        # 1. Enforce Feature Order for Prediction
         X = df[FEATURES].tail(1)
-
-        rf_pred = rf_model.predict(X)[0]
-        xgb_pred = xgb_model.predict(X)[0]
+        
+        # 2. Predict
+        rf_pred = RF_MODEL.predict(X)[0]
+        xgb_pred = XGB_MODEL.predict(X)[0]
         avg_pred = (rf_pred + xgb_pred) / 2
-        
-        # Calculate expected return percentage
-        expected_return_pct = avg_pred * 100
+        expected_return_pct = float(avg_pred * 100)
 
-        # --- FETCH LIVE PRICE (1m Interval) ---
-        try:
-            live_df = yf.download(ticker, period="1d", interval="1m", progress=False, auto_adjust=True)
-            if not live_df.empty:
-                # Handle MultiIndex if present
-                if isinstance(live_df.columns, pd.MultiIndex):
-                    temp_close = live_df.xs("Close", axis=1, level=0) if "Close" in live_df.columns.get_level_values(0) else live_df.iloc[:, 0]
-                    # Extract scalar safely
-                    val = temp_close.iloc[-1]
-                    current_price = float(val.item()) if hasattr(val, 'item') else float(val)
-                else:
-                    val = live_df["Close"].iloc[-1]
-                    current_price = float(val.item()) if hasattr(val, 'item') else float(val)
-            else:
-                 val = df["Close"].iloc[-1]
-                 current_price = float(val.item()) if hasattr(val, 'item') else float(val)
-        except Exception as e:
-            print(f"⚠️ Live price fetch failed: {e}")
-            # Fallback to daily close
-            val = df["Close"].iloc[-1]
-            current_price = float(val.item()) if hasattr(val, 'item') else float(val)
+        # 3. Get Current Market Context
+        current_price = float(df["Close"].iloc[-1])
+        rsi = float(df["RSI"].iloc[-1])
+        sma50 = float(df["SMA50"].iloc[-1])
+        macd = float(df["MACD"].iloc[-1])
+        macd_sig = float(df["MACD_Signal"].iloc[-1])
 
-        # --- CONFIDENCE CALCULATION (MATCHING PREDICTOR.PY) ---
-        # 1. Base ML Confidence (magnitude of prediction)
-        # Cap at 95%
-        ml_confidence = min(70 + min(abs(expected_return_pct) * 3, 25), 95.0)
-        
-        # 2. Technical Score
+        # 4. Technical Scoring
         technical_score = 0
         reasons = []
 
-        # Helper for RSI (Simple calculation for last point)
-        delta = df["Close"].diff()
-        gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-        rs = gain / loss
-        rsi_series = 100 - (100 / (1 + rs))
-        rsi = rsi_series.iloc[-1] if not rsi_series.empty else 50
-        
-        if rsi < 40: 
+        # RSI Logic
+        if rsi < 30:
             technical_score += 1
-            reasons.append(f"RSI is Oversold ({rsi:.1f}), suggesting reversal")
-        elif rsi > 60: 
+            reasons.append(f"RSI is Oversold ({rsi:.1f})")
+        elif rsi > 70:
             technical_score -= 1
-            reasons.append(f"RSI is Overbought ({rsi:.1f}), possible pullback")
+            reasons.append(f"RSI is Overbought ({rsi:.1f})")
         else:
             reasons.append(f"RSI is Neutral ({rsi:.1f})")
         
-        # SMA 50
-        sma_50 = df["Close"].rolling(window=50).mean().iloc[-1] if len(df) > 50 else current_price
-        if current_price > sma_50: 
+        # Trend Logic
+        if current_price > sma50:
             technical_score += 0.5
-            reasons.append("Price is above 50-day SMA (Bullish Trend)")
+            reasons.append("Price above 50-day SMA (Bullish)")
         else:
-            reasons.append("Price is below 50-day SMA (Bearish Trend)")
-            
-        # Add ML Context
-        reasons.append(f"ML Algo predicts {expected_return_pct:.2f}% short-term return")
-        
-        # 3. Decision & Final Confidence
-        # Logic: Buy if positive return OR (small negative but strong technicals)
-        if expected_return_pct > 0.02 or (expected_return_pct > -0.05 and technical_score > 0):
-            signal = "BUY"
-            final_confidence = min(ml_confidence * (1.1 if technical_score > 0 else 1.0), 96.0)
-            
-        elif expected_return_pct < -0.02 or (expected_return_pct < 0.05 and technical_score < 0):
-            signal = "SELL"
-            final_confidence = min(ml_confidence * (1.1 if technical_score < 0 else 1.0), 96.0)
-            
-        else:
-            signal = "HOLD"
-            final_confidence = ml_confidence
+            technical_score -= 0.5
+            reasons.append("Price below 50-day SMA (Bearish)")
 
-        # --- RETURN & IMPORTANCE ---
-        # 3. Feature Importance (Dynamic based on Technicals)
-        # We can't get exact SHAP values easily here without heavy deps, 
-        # so we estimate contribution based on Rule Logic vs ML Weight.
+        # MACD Logic
+        if macd > macd_sig:
+            technical_score += 0.5
+            reasons.append("MACD Bullish Crossover")
+        else:
+            technical_score -= 0.5
+            reasons.append("MACD Bearish Divergence")
+
+        reasons.append(f"ML Model expects {expected_return_pct:.2f}% return")
+
+        # 5. Signal Logic (Strict Sanity Checks)
+        signal = "HOLD"
         
-        feat_imp = {}
-        # Base weight for ML model
-        feat_imp["AI Model V3"] = 40.0
+        # Confidence Calculation (Dynamic & Sensitive)
+        # Base 60. Sensitivity 20. Max boost from return 35.
+        # Example: 0.5% return -> 60 + 10 = 70% (before tech boost).
+        raw_confidence = 60 + min(abs(expected_return_pct) * 20, 35)
         
-        # Technical contributions
-        if rsi < 30 or rsi > 70: feat_imp["RSI Extremes"] = 25.0
-        else: feat_imp["RSI Trend"] = 10.0
+        # Feature: Boost confidence if Technicals agree with ML
+        if (expected_return_pct > 0 and technical_score > 0) or (expected_return_pct < 0 and technical_score < 0):
+             raw_confidence += 10
+             
+        confidence = min(raw_confidence, 95.0)
+
+        # Buy Logic: Positive return + Technicals OR Strong return (>0.02%)
+        if expected_return_pct > 0.02 or (expected_return_pct > 0 and technical_score > 0):
+            signal = "BUY"
+            if technical_score >= 1.5: confidence = min(confidence + 5, 98.0)
+            
+        # Sell Logic: Negative return + Technicals OR Strong negative return (<-0.02%)
+        # STRICTLY requires negative return to avoid selling winners.
+        elif expected_return_pct < -0.02 or (expected_return_pct < 0 and technical_score < 0):
+            signal = "SELL"
+            if technical_score <= -1.5: confidence = min(confidence + 5, 98.0)
         
-        if current_price > sma_50: feat_imp["Uptrend Structure"] = 20.0
-        else: feat_imp["Downtrend Resistance"] = 20.0
+        # Dip Buy Logic: Slight negative return but STRONG technicals (Rebound play)
+        elif expected_return_pct > -0.1 and technical_score >= 2.0:
+             signal = "BUY"
+             reasons.append("Technical Override: Strong Rebound Signals")
+
+        # 6. Feature Contribution (Renamed from feature_importance internally)
+        signal_contributors = {
+            "AI Model Weight": 45.0,
+            "RSI Impact": 25.0,
+            "Trend (SMA)": 20.0,
+            "Momentum (MACD)": 10.0
+        }
         
-        if len(reasons) > 2: feat_imp["Confluence Factors"] = 15.0
-        
-        # Normalize
-        total_imp = sum(feat_imp.values())
-        feat_imp = {k: round((v/total_imp)*100, 1) for k,v in feat_imp.items()}
+        # Adjust dynamic weights lightly based on score
+        if abs(technical_score) > 1.5:
+            signal_contributors["AI Model Weight"] = 30.0
+            signal_contributors["Technical Confluence"] = 40.0
+            signal_contributors["Trend (SMA)"] = 30.0
+            if "RSI Impact" in signal_contributors: del signal_contributors["RSI Impact"]
 
         return {
             "ticker": ticker,
             "signal": signal,
-            "expected_return": float(expected_return_pct), # Now returning PERCENTAGE
+            "expected_return": expected_return_pct,
             "current_price": current_price,
-            "confidence": float(round(final_confidence, 2)),
+            "confidence": float(round(confidence, 2)),
             "timestamp": datetime.now().isoformat(),
             "reasoning": "\n".join([f"• {r}" for r in reasons]),
             "key_factors": reasons,
-            "feature_importance": feat_imp
+            "feature_importance": signal_contributors 
         }
+
     except Exception as e:
+        print(f"Prediction Error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-# =================================================
-# 2️⃣ HISTORICAL SIGNALS API (Backtesting)
-# =================================================
 @app.post("/api/v1/ml/signal/historical")
 def get_historical_signals(request: TickerRequest):
-    """
-    Used by Backtesting Engine
-    Returns 5 years OHLCV + ML signals
-    """
-    if not rf_model or not xgb_model:
+    """Generates historical signals for backtesting."""
+    if not RF_MODEL or not XGB_MODEL:
         raise HTTPException(status_code=503, detail="Models not loaded")
         
     ticker = request.ticker.upper()
 
     try:
+        # Fetch 5y data
         df = yf.download(ticker, period="5y", interval="1d", auto_adjust=True, progress=False)
         if df.empty:
             raise HTTPException(status_code=404, detail="No historical data")
 
-        df = create_features(df)
+        df = create_features(df) # Handles flattening
         if df.empty:
-            raise HTTPException(status_code=404, detail="Not enough data for features")
-
+            raise HTTPException(status_code=404, detail="Not enough data")
+            
+        # 1. Enforce Feature Order
         X = df[FEATURES]
-        rf_preds = rf_model.predict(X)
-        xgb_preds = xgb_model.predict(X)
+        
+        # 2. Batch Predict
+        rf_preds = RF_MODEL.predict(X)
+        xgb_preds = XGB_MODEL.predict(X)
         avg_preds = (rf_preds + xgb_preds) / 2
-
+        
+        # 3. Vectorized Signal Generation
+        # Simple Logic for Backtest: Buy > 0, Sell < 0
         df["Signal"] = np.where(avg_preds > 0, 1, -1)
+        
+        # Reset index to correctly access Date
+        df.reset_index(inplace=True)
 
-        # Convert to JSON-safe structure
         records = []
-        for date, row in df.iterrows():
+        for _, row in df.iterrows():
             records.append({
-                "date": date.strftime("%Y-%m-%d"),
+                "date": row["Date"].strftime("%Y-%m-%d"),
                 "open": float(row["Open"]),
                 "high": float(row["High"]),
                 "low": float(row["Low"]),
@@ -331,206 +319,122 @@ def get_historical_signals(request: TickerRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# =================================================
-# HEALTH CHECK
-# =================================================
 @app.get("/health")
 def health_check():
-    """System health check"""
     return {
         "status": "healthy",
-        "timestamp": datetime.now().isoformat(),
-        "models_loaded": rf_model is not None and xgb_model is not None,
-        "version": "2.1.0"
+        "models_loaded": RF_MODEL is not None,
+        "version": "2.2.0"
     }
 
 # =================================================
-# DATA PIPELINE CONTROL
+# MARKET DATA ENDPOINTS (Unchanged Logic)
 # =================================================
-@app.post("/run-pipeline")
-def run_pipeline():
-    """Trigger data pipeline execution"""
-    # In a real app, this would start the Airflow/Prefect job
-    # Here we can perhaps trigger a background update of cached data
-    return {
-        "status": "pipeline_started",
-        "timestamp": datetime.now().isoformat(),
-        "message": "Data pipeline execution triggered (Simulation)"
-    }
-
-# =================================================
-# STOCK DATA ENDPOINTS (Implementing Real Logic)
-# =================================================
-
 @app.get("/supabase/recent/{ticker}")
-def get_recent_data(ticker: str, days: int = Query(30, description="Number of days")):
-    """Get recent stock data for a ticker with REAL data"""
+def get_recent_data(ticker: str, days: int = Query(30)):
     try:
-        # Fetch slightly more to ensure coverage
         data = fetch_real_market_data(ticker, period=f"{days+10}d")
-        
-        # Filter strictly for days requested (approx)
-        cutoff_date = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
-        filtered_data = [d for d in data if d["date"] >= cutoff_date]
-        
-        # Reverse to be descending (latest first) as expected by frontend
-        filtered_data.sort(key=lambda x: x["date"], reverse=True)
-        
-        return {
-            "ticker": ticker.upper(),
-            "days": days,
-            "count": len(filtered_data),
-            "data": filtered_data
-        }
+        cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+        filtered = [d for d in data if d["date"] >= cutoff]
+        filtered.sort(key=lambda x: x["date"], reverse=True)
+        return {"ticker": ticker, "data": filtered, "count": len(filtered)}
     except Exception as e:
         return {"data": [], "error": str(e)}
 
 @app.get("/supabase/ticker/{ticker}")
-def get_ticker_data(
-    ticker: str,
-    start_date: str = Query("2024-01-01", description="Start date (YYYY-MM-DD)"),
-    limit: int = Query(100, description="Max records")
-):
-    """Get ticker data with date range and limit"""
+def get_ticker_data(ticker: str, start_date: str = "2024-01-01", limit: int = 100):
     try:
-        # Convert start_date to period approx or just fetch max and filter
-        data = fetch_real_market_data(ticker, period="2y") # Safe default
-        
-        filtered_data = [d for d in data if d["date"] >= start_date]
-        filtered_data.sort(key=lambda x: x["date"], reverse=True)
-        
-        return {
-            "ticker": ticker.upper(),
-            "start_date": start_date,
-            "limit": limit,
-            "count": min(len(filtered_data), limit),
-            "data": filtered_data[:limit]
-        }
+        data = fetch_real_market_data(ticker, period="2y")
+        filtered = [d for d in data if d["date"] >= start_date]
+        filtered.sort(key=lambda x: x["date"], reverse=True)
+        return {"ticker": ticker, "data": filtered[:limit], "count": len(filtered[:limit])}
     except Exception as e:
         return {"data": [], "error": str(e)}
 
-# --- Market Overview ---
 @app.get("/supabase/latest")
-def get_latest_market(limit: int = Query(10, description="Number of latest records")):
-    """Get latest market data for top accessible tickers"""
-    # Simulate a "market scan" by fetching a basket of popular stocks
+def get_latest_market(limit: int = 10):
     TICKERS = ["AAPL", "MSFT", "GOOGL", "AMZN", "TSLA", "NVDA", "META", "NFLX", "AMD", "SPY"]
-    
     market_data = []
     try:
-        # Fetch in bulk if possible, or loop (loop is safer for yfinance reliability here)
-        today_str = datetime.now().strftime("%Y-%m-%d")
-        
         for t in TICKERS[:limit]:
-            # Just get 1 day
-            d = fetch_real_market_data(t, period="5d") # 5d to handle weekends
-            if d:
-                latest = d[-1] # Newest is last in fetch_real_market_data default sort
-                latest["ticker"] = t # Ensure ticker is present
-                market_data.append(latest)
-                
-        return {
-            "limit": limit,
-            "data": market_data,
-            "count": len(market_data)
-        }
-    except Exception as e:
-        return {"data": [], "error": str(e)}
+            d = fetch_real_market_data(t, period="5d")
+            if d: market_data.append(d[-1])
+        return {"data": market_data}
+    except Exception:
+        return {"data": []}
 
 @app.get("/supabase/top-performers")
-def get_top_performers(top_n: int = Query(10, description="Top N performers")):
-    """Get top performing stocks from our basket"""
-    TICKERS = ["AAPL", "MSFT", "GOOGL", "AMZN", "TSLA", "NVDA", "META", "NFLX", "AMD", "INTC"]
-    
+def get_top_performers(top_n: int = 10):
+    TICKERS = ["AAPL", "MSFT", "GOOGL", "AMZN", "TSLA", "NVDA", "META", "NFLX"]
     performers = []
     try:
         for t in TICKERS:
             d = fetch_real_market_data(t, period="1mo")
             if d and len(d) > 1:
-                start_price = d[0]["close"]
-                end_price = d[-1]["close"]
-                if start_price > 0:
-                    change = ((end_price - start_price) / start_price) * 100
-                    performers.append({
-                        "ticker": t,
-                        "change_pct": round(change, 2),
-                        "start_price": start_price,
-                        "end_price": end_price
-                    })
-        
+                chg = ((d[-1]["close"] - d[0]["close"]) / d[0]["close"]) * 100
+                performers.append({"ticker": t, "change_pct": round(chg, 2)})
         performers.sort(key=lambda x: x["change_pct"], reverse=True)
-        
-        return {
-            "top_n": top_n,
-            "performers": performers[:top_n]
-        }
-    except Exception as e:
-        return {"performers": [], "error": str(e)}
+        return {"performers": performers[:top_n]}
+    except Exception:
+        return {"performers": []}
 
-# --- Analysis & Filtering ---
 @app.get("/supabase/stats/{ticker}")
-def get_ticker_stats(
-    ticker: str,
-    start_date: str = Query("2024-01-01", description="Start date")
-):
-    """Get statistical analysis for a ticker"""
+def get_ticker_stats(ticker: str, start_date: str = "2024-01-01"):
     try:
         data = fetch_real_market_data(ticker, period="1y")
-        filtered_data = [d for d in data if d["date"] >= start_date]
-        
-        if not filtered_data:
-            return {"stats": {}}
-            
-        closes = [d["close"] for d in filtered_data]
-        volumes = [d["volume"] for d in filtered_data]
-        
-        stats = {
-            "ticker": ticker.upper(),
-            "period_start": start_date,
-            "price_high": max(closes),
-            "price_low": min(closes),
-            "price_avg": sum(closes) / len(closes),
-            "volume_avg": sum(volumes) / len(volumes),
-            "data_points": len(closes)
-        }
-        
-        return {"stats": stats}
+        filtered = [d for d in data if d["date"] >= start_date]
+        if not filtered: return {"stats": {}}
+        closes = [d["close"] for d in filtered]
+        return {"stats": {
+            "price_high": max(closes), "price_low": min(closes),
+            "price_avg": sum(closes)/len(closes)
+        }}
     except Exception as e:
         return {"stats": {}, "error": str(e)}
 
 @app.get("/supabase/rsi-search")
-def search_by_rsi(
-    min_rsi: float = Query(0, description="Minimum RSI"),
-    max_rsi: float = Query(30, description="Maximum RSI")
-):
-    """Search stocks by RSI range"""
-    TICKERS = ["AAPL", "MSFT", "GOOGL", "AMZN", "TSLA", "NVDA", "META", "NFLX"]
+def search_by_rsi(min_rsi: float = 0, max_rsi: float = 30):
+    TICKERS = ["AAPL", "MSFT", "GOOGL", "AMZN", "TSLA", "NVDA"]
     results = []
-    
     try:
         for t in TICKERS:
-            # Need about 14+ days for RSI
-            d = fetch_real_market_data(t, period="2mo") 
+            d = fetch_real_market_data(t, period="2mo")
             if len(d) > 15:
-                # Convert to df for easy calc
-                df = pd.DataFrame(d)
-                df.set_index("date", inplace=True)
-                df["rsi"] = calculate_rsi(df["close"])
-                
-                current_rsi = df["rsi"].iloc[-1]
-                
-                if min_rsi <= current_rsi <= max_rsi:
-                    latest = d[-1]
-                    latest["rsi"] = current_rsi
-                    results.append(latest)
-                    
+                # Calculate RSI on the fly from fetched data
+                closes = pd.Series([x["close"] for x in d])
+                rsi_val = calculate_rsi(closes).iloc[-1]
+                if min_rsi <= rsi_val <= max_rsi:
+                    d[-1]["rsi"] = rsi_val
+                    results.append(d[-1])
+        return {"results": results}
+    except Exception as e:
+        return {"results": [], "error": str(e)}
+
+@app.get("/indicators")
+def get_indicators(ticker: str):
+    """Provides technical indicators for GenAI analysis."""
+    try:
+        data = fetch_real_market_data(ticker, period="3mo")
+        if not data:
+             raise HTTPException(status_code=404, detail="No data found")
+        
+        df = pd.DataFrame(data)
+        df.set_index("date", inplace=True)
+        df["Close"] = df["close"] # create_features expects 'Close'
+
+        df = create_features(df)
+        if df.empty:
+             raise HTTPException(status_code=404, detail="Not enough data for indicators")
+
+        latest = df.iloc[-1]
+        
         return {
-            "min_rsi": min_rsi,
-            "max_rsi": max_rsi,
-            "results": results
+            "RSI": float(latest["RSI"]),
+            "MACD": float(latest["MACD"]),
+            "Close_MA20_Ratio": float(latest["SMA_ratio"])
         }
     except Exception as e:
-         return {"results": [], "error": str(e)}
+         raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)

@@ -38,6 +38,7 @@ else {
 Write-Host "   - Signals API:    Port 8000"
 Write-Host "   - Alerts API:     Port 8001"
 Write-Host "   - Backtesting API: Port 8002"
+Write-Host "   - GenAI API:      Port 8003"
 
 Write-Host "Starting Dashboard..."
 python -m streamlit run 0_Overview.py

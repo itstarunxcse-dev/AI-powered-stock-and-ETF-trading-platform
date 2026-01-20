@@ -12,5 +12,9 @@ Write-Host "✅ Alerts API started on Port 8001"
 Start-Process python -ArgumentList "-m uvicorn backtesting.main:app --host 0.0.0.0 --port 8002" -WindowStyle Minimized
 Write-Host "✅ Backtesting API started on Port 8002"
 
+# Start GenAI API (Port 8003)
+Start-Process python -ArgumentList "-m uvicorn genai.main:app --host 0.0.0.0 --port 8003" -WindowStyle Minimized
+Write-Host "✅ GenAI API started on Port 8003"
+
 Write-Host "Services are running in background windows."
 Write-Host "You can now run 'run_project.ps1' to start the dashboard."

@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Optional, List, Protocol
 from dataclasses import dataclass, field
 import datetime
-
+import requests
 # --- Configuration & Path Setup ---
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
@@ -565,7 +565,51 @@ def main():
         
         with tab2:
             st.markdown("""<div style='margin-top: 10px;'></div>""", unsafe_allow_html=True)
+            st.markdown("""<div style='margin-top: 10px;'></div>""", unsafe_allow_html=True)
             render_prediction_card(ml_signal)
+
+            st.markdown("---")
+            st.markdown("### 🧬 GenAI Deep Dive")
+            st.caption("Powered by Google Gemini 2.5 • Analyzes News & Technicals")
+
+            # Unique key for every ticker analysis to reset state
+            genai_key = f"genai_btn_{stock_data.symbol}"
+            
+            if st.button("✨ Generate AI Narrative Analysis", key=genai_key, type="secondary", use_container_width=True):
+                with st.spinner(f"🧠 Reading news & analyzing charts for {stock_data.symbol}..."):
+                    try:
+                        # Call GenAI API (Port 8003)
+                        response = requests.get("http://localhost:8003/predict_stock", params={"ticker": stock_data.symbol}, timeout=60)
+                        
+                        if response.status_code == 200:
+                            data = response.json()
+                            signal = data.get("signal", "HOLD").upper()
+                            explanation = data.get("explanation", "No explanation provided.")
+                            
+                            # Distinct Styles for GenAI Result
+                            bg_color = "rgba(0, 255, 127, 0.1)" if signal == "BUY" else "rgba(255, 99, 71, 0.1)" if signal == "SELL" else "rgba(255, 215, 0, 0.1)"
+                            border_color = "#00ff7f" if signal == "BUY" else "#ff6347" if signal == "SELL" else "#ffd700"
+                            
+                            st.markdown(f"""
+                                <div style="
+                                    background: {bg_color}; 
+                                    border: 1px solid {border_color}; 
+                                    border-radius: 12px; 
+                                    padding: 20px; 
+                                    margin-top: 15px;
+                                    animation: fadeIn 0.5s ease-in;">
+                                    <div style="font-weight: 800; font-size: 18px; color: {border_color}; margin-bottom: 10px;">
+                                        🤖 GenAI Recommendation: {signal}
+                                    </div>
+                                    <div style="font-size: 15px; line-height: 1.6; color: #e2e8f0; font-family: 'Inter', sans-serif;">
+                                        {explanation.replace(chr(10), '<br>')}
+                                    </div>
+                                </div>
+                            """, unsafe_allow_html=True)
+                        else:
+                            st.warning(f"GenAI Service Unavailable (Status {response.status_code}).")
+                    except Exception as e:
+                        st.error(f"Could not connect to GenAI service: {e}")
 
         with tab3:
             st.markdown("### 🎯 Technical Indicators")
